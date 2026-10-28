@@ -6,6 +6,14 @@ on:
       ref:
         description: "Full 40-character commit SHA to build"
         required: true
+      variant:
+        description: "Build variant"
+        required: true
+        default: braveheart
+        type: choice
+        options:
+          - braveheart
+          - release
 
 permissions:
   contents: read
@@ -45,6 +53,42 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - name: Pre-fetch opencv-mobile (upstream URL is broken)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ASSET="opencv-mobile-4.10.0-android.zip"
+          DEST="app/src/main/cpp/opencv"
+
+          # Find the real download URL for this asset across opencv-mobile releases
+          URL="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                  "https://api.github.com/repos/nihui/opencv-mobile/releases?per_page=100" \
+                | jq -r --arg a "$ASSET" \
+                    '[.[] | .assets[] | select(.name == $a) | .browser_download_url][0] // empty')"
+          if [ -z "$URL" ]; then
+            echo "::error::Could not find $ASSET in nihui/opencv-mobile releases"
+            exit 1
+          fi
+          echo "Downloading: $URL"
+
+          curl -fL --retry 3 -o "$RUNNER_TEMP/ocv.zip" "$URL"
+          sha256sum "$RUNNER_TEMP/ocv.zip" | tee opencv-sha256.txt
+          echo "Source URL: $URL" >> opencv-sha256.txt
+
+          unzip -q "$RUNNER_TEMP/ocv.zip" -d "$RUNNER_TEMP/ocv"
+          SRC="$(find "$RUNNER_TEMP/ocv" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+
+          mkdir -p "$DEST/lib/arm64-v8a"
+          cp "$SRC"/sdk/native/staticlibs/arm64-v8a/* "$DEST/lib/arm64-v8a/"
+          rm -rf "$DEST/include"
+          cp -r "$SRC/sdk/native/jni/include" "$DEST/include"
+
+          test -f "$DEST/lib/arm64-v8a/libopencv_core.a" || { echo "::error::libopencv_core.a missing"; exit 1; }
+          test -d "$DEST/include/opencv2" || { echo "::error::opencv2 headers missing"; exit 1; }
+          echo "OpenCV ready:"
+          ls "$DEST/lib/arm64-v8a"
+
       - name: Install NDK and CMake (using preinstalled Android SDK)
         run: |
           SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
@@ -54,6 +98,37 @@ jobs:
           yes | "$SDKM" --licenses > /dev/null || true
           "$SDKM" --install "ndk;26.1.10909125" "cmake;3.22.1"
           echo "ANDROID_NDK_HOME=$SDK/ndk/26.1.10909125" >> "$GITHUB_ENV"
+
+      - name: Diagnose source sets and resources
+        run: |
+          echo "== Source sets under app/src:"
+          ls app/src
+          echo
+          echo "== Build types / variants in app/build.gradle.kts:"
+          grep -nE 'create\("|getByName\("|braveheart' app/build.gradle.kts | head -30 || true
+          echo
+          echo "== Files matching google_maps_logo:"
+          git ls-files | grep -i 'google_maps_logo' || echo "(none tracked in git)"
+          echo
+          echo "== Prebuilt binaries committed to the repo (not built from source):"
+          git ls-files | grep -Ei '\.(so|jar|aar|tflite|bin|dex|apk)$' || echo "(none)"
+
+      - name: Add placeholder for uncommitted Google logo (only if missing)
+        run: |
+          if git ls-files | grep -qi 'google_maps_logo_gray'; then
+            echo "google_maps_logo_gray is in the repo; no placeholder needed."
+          else
+            F=app/src/main/res/drawable/google_maps_logo_gray.xml
+            mkdir -p "$(dirname "$F")"
+            printf '%s\n' \
+              '<vector xmlns:android="http://schemas.android.com/apk/res/android"' \
+              '    android:width="60dp" android:height="18dp"' \
+              '    android:viewportWidth="60" android:viewportHeight="18">' \
+              '  <path android:fillColor="#9E9E9E" android:pathData="M0,0h60v18h-60z"/>' \
+              '</vector>' > "$F"
+            echo "::warning::Created placeholder $F (logo not committed upstream)"
+            echo "placeholder: $F" > build-modifications.txt
+          fi
 
       - name: Restore signing key
         env:
@@ -66,24 +141,34 @@ jobs:
           echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
           ls -l "$RUNNER_TEMP/release.jks"
 
-      - name: Build release APK
+      - name: Build APK
         env:
+          VARIANT: ${{ inputs.variant }}
           KEYSTORE_FILE: ${{ runner.temp }}/release.jks
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_ALIAS: overdrive
         run: |
           chmod +x gradlew
-          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+          TASK=":app:assemble${VARIANT^}"
+          echo "Running Gradle task: $TASK"
+          ./gradlew "$TASK" --no-daemon --stacktrace
 
       - name: Verify APK signature and record hashes
         run: |
           SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
           APKSIGNER="$(ls -d "$SDK"/build-tools/*/apksigner | sort -V | tail -n1)"
+          shopt -s nullglob
+          APKS=(app/build/outputs/apk/*/*.apk)
+          if [ ${#APKS[@]} -eq 0 ]; then
+            echo "::error::No APK produced"
+            exit 1
+          fi
           {
-            echo "Commit: $(git rev-parse HEAD)"
+            echo "Commit:  $(git rev-parse HEAD)"
+            echo "Variant: ${{ inputs.variant }}"
             echo
-            for apk in app/build/outputs/apk/release/*.apk; do
+            for apk in "${APKS[@]}"; do
               echo "== $apk"
               sha256sum "$apk"
               "$APKSIGNER" verify --print-certs "$apk"
@@ -94,11 +179,23 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v5
         with:
-          name: overdrive-apk-${{ inputs.ref }}
+          name: overdrive-${{ inputs.variant }}-${{ inputs.ref }}
           path: |
-            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/*/*.apk
             build-info.txt
-          if-no-files-found: error
+            opencv-sha256.txt
+            build-modifications.txt
+          if-no-files-found: warn
+
+      - name: Upload build reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: build-reports-${{ inputs.ref }}
+          path: |
+            build/reports/
+            app/build/reports/
+          if-no-files-found: ignore
 
       - name: Remove signing key
         if: always()
