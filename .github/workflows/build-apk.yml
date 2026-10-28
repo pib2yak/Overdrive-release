@@ -61,7 +61,6 @@ jobs:
           ASSET="opencv-mobile-4.10.0-android.zip"
           DEST="app/src/main/cpp/opencv"
 
-          # Find the real download URL for this asset across opencv-mobile releases
           URL="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
                   "https://api.github.com/repos/nihui/opencv-mobile/releases?per_page=100" \
                 | jq -r --arg a "$ASSET" \
@@ -107,18 +106,26 @@ jobs:
           echo "== Build types / variants in app/build.gradle.kts:"
           grep -nE 'create\("|getByName\("|braveheart' app/build.gradle.kts | head -30 || true
           echo
-          echo "== Files matching google_maps_logo:"
+          echo "== Google Maps logo files tracked in git:"
           git ls-files | grep -i 'google_maps_logo' || echo "(none tracked in git)"
           echo
           echo "== Prebuilt binaries committed to the repo (not built from source):"
           git ls-files | grep -Ei '\.(so|jar|aar|tflite|bin|dex|apk)$' || echo "(none)"
 
-      - name: Add placeholder for uncommitted Google logo (only if missing)
+      - name: Add placeholders for uncommitted Google Maps logos
         run: |
-          if git ls-files | grep -qi 'google_maps_logo_gray'; then
-            echo "google_maps_logo_gray is in the repo; no placeholder needed."
-          else
-            F=app/src/main/res/drawable/google_maps_logo_gray.xml
+          set -euo pipefail
+          NAMES="$(grep -rhoE '(R\.drawable\.|@drawable/)google_maps_logo_[A-Za-z0-9_]+' app/src \
+                   | sed -E 's/.*(google_maps_logo_[A-Za-z0-9_]+)/\1/' | sort -u || true)"
+          echo "Google logo drawables referenced in source:"
+          echo "${NAMES:-(none)}"
+
+          for NAME in $NAMES; do
+            if [ -n "$(find app/src -path '*/res/drawable*' -name "$NAME.*" -print -quit)" ]; then
+              echo "present: $NAME"
+              continue
+            fi
+            F="app/src/main/res/drawable/$NAME.xml"
             mkdir -p "$(dirname "$F")"
             printf '%s\n' \
               '<vector xmlns:android="http://schemas.android.com/apk/res/android"' \
@@ -126,9 +133,9 @@ jobs:
               '    android:viewportWidth="60" android:viewportHeight="18">' \
               '  <path android:fillColor="#9E9E9E" android:pathData="M0,0h60v18h-60z"/>' \
               '</vector>' > "$F"
-            echo "::warning::Created placeholder $F (logo not committed upstream)"
-            echo "placeholder: $F" > build-modifications.txt
-          fi
+            echo "::warning::Created placeholder $F (not committed upstream)"
+            echo "placeholder: $F" >> build-modifications.txt
+          done
 
       - name: Restore signing key
         env:
@@ -152,7 +159,8 @@ jobs:
           chmod +x gradlew
           TASK=":app:assemble${VARIANT^}"
           echo "Running Gradle task: $TASK"
-          ./gradlew "$TASK" --no-daemon --stacktrace
+          ./gradlew "$TASK" --no-daemon --stacktrace \
+            -Pkotlin.compiler.execution.strategy=in-process
 
       - name: Verify APK signature and record hashes
         run: |
